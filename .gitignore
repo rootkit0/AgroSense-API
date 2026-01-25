@@ -1,0 +1,67 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+pip-wheel-metadata/
+
+# Packaging / builds
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Unit test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.pytype/
+.pyre/
+
+# Logs
+*.log
+
+# ------------------------------
+# IDEs / OS
+# ------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ------------------------------
+# FastAPI / Uvicorn / local config
+# ------------------------------
+.env
+.env.*
+*.env
+*.local
+instance/
+*.sqlite3
+
+# ------------------------------
+# Firebase secrets / service account
+# ------------------------------
+firebase-account.json
+**/firebase-account.json
+
+# (opcional) otras credenciales comunes
+*.pem
+*.key
+*.p12
+credentials*.json
+
+# ------------------------------
+# Jupyter (si aplica)
+# ------------------------------
+.ipynb_checkpoints/
