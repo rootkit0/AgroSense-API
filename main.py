@@ -448,3 +448,140 @@ def purge_readings(
         "first": snaps[0].reference.path,
         "last": snaps[-1].reference.path,
     }
+
+@app.post("/maintenance/recompute-tenant-stats")
+def recompute_tenant_stats(
+    tenant_id: str = Query(...),
+    stale_hours: int = Query(2, ge=1, le=168),
+    low_batt: int = Query(20, ge=1, le=100),
+    _: None = Depends(verify_api_key),
+):
+    now = datetime.now(timezone.utc)
+    stale_cutoff = now - timedelta(hours=stale_hours)
+
+    sensors_ref = db.collection(f"tenants/{tenant_id}/sensors")
+    sensors_total = 0
+    sensors_active = 0
+    battery_low = 0
+
+    for s in sensors_ref.stream():
+      sensors_total += 1
+      d = s.to_dict() or {}
+      st = (d.get("status") or {})
+      last_seen = st.get("lastSeenAt")
+      batt = st.get("batteryPct")
+
+      if isinstance(last_seen, datetime) and last_seen >= stale_cutoff:
+        sensors_active += 1
+
+      if isinstance(batt, (int, float)) and batt < low_batt:
+        battery_low += 1
+
+    sensors_stale = max(0, sensors_total - sensors_active)
+
+    alerts_open = 0
+    alerts_critical_open = 0
+    alerts_ref = db.collection(f"tenants/{tenant_id}/alerts")
+    for a in alerts_ref.where("status", "==", "open").stream():
+      alerts_open += 1
+      d = a.to_dict() or {}
+      if d.get("severity") == "critical":
+        alerts_critical_open += 1
+
+    recs_open = 0
+    recs_last24h = 0
+    recs_ref = db.collection(f"tenants/{tenant_id}/aiRecommendations")
+
+    last24h_cutoff = now - timedelta(hours=24)
+    for r in recs_ref.stream():
+      d = r.to_dict() or {}
+      status = d.get("status", "open")
+      if status != "done":
+        recs_open += 1
+
+      created = d.get("createdAt")
+      if isinstance(created, datetime) and created >= last24h_cutoff:
+        recs_last24h += 1
+
+    stats_ref = db.document(f"tenants/{tenant_id}/stats/current")
+    stats_ref.set({
+      "updatedAt": firestore.SERVER_TIMESTAMP,
+      "staleMs": stale_hours * 60 * 60 * 1000,
+      "sensors": {
+        "total": sensors_total,
+        "active": sensors_active,
+        "stale": sensors_stale,
+        "batteryLow": battery_low,
+      },
+      "alerts": {
+        "open": alerts_open,
+        "criticalOpen": alerts_critical_open,
+      },
+      "recs": {
+        "open": recs_open,
+        "last24h": recs_last24h,
+      }
+    }, merge=True)
+
+    return {"status": "ok", "tenantId": tenant_id}
+
+@app.post("/maintenance/recompute-all-tenant-stats")
+def recompute_all_tenant_stats(
+    stale_hours: int = Query(2, ge=1, le=168),
+    low_batt: int = Query(20, ge=1, le=100),
+    _: None = Depends(verify_api_key),
+):
+    tenants = [t.id for t in db.collection("tenants").stream()]
+    done = []
+    for tid in tenants:
+      now = datetime.now(timezone.utc)
+      stale_cutoff = now - timedelta(hours=stale_hours)
+
+      sensors_total = 0
+      sensors_active = 0
+      battery_low = 0
+      for s in db.collection(f"tenants/{tid}/sensors").stream():
+        sensors_total += 1
+        d = s.to_dict() or {}
+        st = (d.get("status") or {})
+        last_seen = st.get("lastSeenAt")
+        batt = st.get("batteryPct")
+        if isinstance(last_seen, datetime) and last_seen >= stale_cutoff:
+          sensors_active += 1
+        if isinstance(batt, (int, float)) and batt < low_batt:
+          battery_low += 1
+
+      alerts_open = 0
+      alerts_critical_open = 0
+      for a in db.collection(f"tenants/{tid}/alerts").where("status", "==", "open").stream():
+        alerts_open += 1
+        if (a.to_dict() or {}).get("severity") == "critical":
+          alerts_critical_open += 1
+
+      recs_open = 0
+      recs_last24h = 0
+      last24h_cutoff = now - timedelta(hours=24)
+      for r in db.collection(f"tenants/{tid}/aiRecommendations").stream():
+        d = r.to_dict() or {}
+        if d.get("status", "open") != "done":
+          recs_open += 1
+        created = d.get("createdAt")
+        if isinstance(created, datetime) and created >= last24h_cutoff:
+          recs_last24h += 1
+
+      db.document(f"tenants/{tid}/stats/current").set({
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "staleMs": stale_hours * 60 * 60 * 1000,
+        "sensors": {
+          "total": sensors_total,
+          "active": sensors_active,
+          "stale": max(0, sensors_total - sensors_active),
+          "batteryLow": battery_low,
+        },
+        "alerts": {"open": alerts_open, "criticalOpen": alerts_critical_open},
+        "recs": {"open": recs_open, "last24h": recs_last24h},
+      }, merge=True)
+
+      done.append(tid)
+
+    return {"status": "ok", "tenants": done}
