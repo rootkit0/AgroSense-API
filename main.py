@@ -163,27 +163,43 @@ def write_index(device_id: str, tenant_id: str, sensor_id: str):
     )
 
 def resolve_sensor(device_id: str):
-    idx = resolve_sensor_by_index(device_id)
-    if idx:
-        return idx[0], idx[1]
+    idx_ref = db.document(f"deviceIndex/{device_id}")
+    snap = idx_ref.get()
+    if snap.exists:
+        d = snap.to_dict() or {}
+        if d.get("tenantId") and d.get("sensorId"):
+            return d["tenantId"], d["sensorId"]
 
     docs = list(
         db.collection_group("sensors")
-          .where("deviceId", "==", device_id)
+          .where("hardwareId", "==", device_id)
           .limit(2)
           .stream()
     )
+
     if not docs:
-        raise HTTPException(status_code=404, detail=f"Sensor no registrado para deviceId={device_id}")
+        docs = list(
+            db.collection_group("sensors")
+              .where("deviceId", "==", device_id)
+              .limit(2)
+              .stream()
+        )
+
+    if not docs:
+        raise HTTPException(status_code=404, detail=f"Sensor no registrado para id={device_id}")
     if len(docs) > 1:
-        raise HTTPException(status_code=409, detail=f"deviceId duplicado en múltiples sensores: {device_id}")
+        raise HTTPException(status_code=409, detail=f"id duplicado en múltiples sensores: {device_id}")
 
     snap = docs[0]
     parts = snap.reference.path.split("/")
     tenant_id = parts[1]
     sensor_id = parts[3]
 
-    write_index(device_id, tenant_id, sensor_id)
+    db.document(f"deviceIndex/{device_id}").set(
+        {"tenantId": tenant_id, "sensorId": sensor_id, "updatedAt": firestore.SERVER_TIMESTAMP},
+        merge=True
+    )
+
     return tenant_id, sensor_id
 
 # ---------- DAILY AGG ----------
@@ -366,6 +382,29 @@ def get_device_resolve(device_id: str, _: None = Depends(verify_api_key)):
         "sensorId": sensor_id,
         "sensor": snap.to_dict() if snap.exists else None
     }
+
+@app.get("/devices/{device_id}/config")
+def get_device_config(device_id: str, _: None = Depends(verify_api_key)):
+    tenant_id, sensor_id = resolve_sensor(device_id)
+    ref = db.document(f"tenants/{tenant_id}/sensors/{sensor_id}")
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="sensor no encontrado")
+
+    s = snap.to_dict() or {}
+    cfg = (s.get("telemetryConfig") or {})
+
+    out = {
+        "deviceId": device_id,
+        "tenantId": tenant_id,
+        "sensorId": sensor_id,
+        "telemetryConfig": {
+            "intervalSec": cfg.get("intervalSec", 300),
+            "samplesPerBatch": cfg.get("samplesPerBatch", 12),
+            "enabled": cfg.get("enabled", {}),
+        }
+    }
+    return out
 
 @app.get("/tenants/{tenant_id}/sensors/{sensor_id}/readings")
 def get_sensor_readings(
