@@ -11,6 +11,7 @@ from firebase_admin import credentials, firestore
 API_KEY = os.getenv("AGROMIND_API_KEY", "iC6919i3f88i342Q")
 
 SAMPLE_INTERVAL_SEC_DEFAULT = 900
+RAW_RETENTION_DAYS = int(os.getenv("RAW_RETENTION_DAYS", "60"))
 
 RANGE_MAP = {
     "1h": timedelta(hours=1),
@@ -269,11 +270,14 @@ def ingest_batch(measurement_type: str, payload: BaseTelemetry, samples: list):
         reading_id = ts.strftime("%Y%m%d%H%M")
         reading_ref = db.document(f"tenants/{tenant_id}/sensors/{sensor_id}/readings/{reading_id}")
 
+        expires_at = ts + timedelta(days=RAW_RETENTION_DAYS)
+
         data = {
-            "ts": ts,
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-            "meta": meta,
-            "meta.lastType": measurement_type,
+        "ts": ts,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "meta": meta,
+        "meta.lastType": measurement_type,
+        "expiresAt": expires_at,
         }
         for k, v in values.items():
             data[f"values.{k}"] = v
@@ -401,3 +405,46 @@ def get_sensor_daily_agg(
         d = s.to_dict() or {}
         rows.append({"id": s.id, **d})
     return {"tenantId": tenant_id, "sensorId": sensor_id, "days": days, "items": rows}
+
+# ---------- MAINTENANCE endpoints ----------
+@app.post("/maintenance/purge-readings")
+def purge_readings(
+    older_than_days: int = Query(30, ge=1, le=3650),
+    batch_size: int = Query(500, ge=1, le=500),
+    dry_run: bool = Query(False),
+    _: None = Depends(verify_api_key),
+):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+
+    q = (
+        db.collection_group("readings")
+          .where("ts", "<", cutoff)
+          .order_by("ts", direction=firestore.Query.ASCENDING)
+          .limit(batch_size)
+    )
+
+    snaps = list(q.stream())
+    if not snaps:
+        return {"status": "ok", "cutoff": cutoff.isoformat(), "deleted": 0}
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "cutoff": cutoff.isoformat(),
+            "wouldDelete": len(snaps),
+            "first": snaps[0].reference.path,
+            "last": snaps[-1].reference.path,
+        }
+
+    b = db.batch()
+    for s in snaps:
+        b.delete(s.reference)
+    b.commit()
+
+    return {
+        "status": "ok",
+        "cutoff": cutoff.isoformat(),
+        "deleted": len(snaps),
+        "first": snaps[0].reference.path,
+        "last": snaps[-1].reference.path,
+    }
