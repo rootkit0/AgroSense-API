@@ -1,17 +1,23 @@
 from fastapi import FastAPI, HTTPException, Depends, Query, Header
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
 import os
 
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+
 # ---------- CONFIG ----------
 API_KEY = os.getenv("AGROMIND_API_KEY", "iC6919i3f88i342Q")
 
 SAMPLE_INTERVAL_SEC_DEFAULT = 900
+SAMPLES_PER_BATCH_DEFAULT = 4
 RAW_RETENTION_DAYS = int(os.getenv("RAW_RETENTION_DAYS", "60"))
+
+MAX_SCHEDULE = 4
+MAX_ITEMS_PER_BATCH = 4
+MAX_SAMPLES_PER_ITEM = 48
 
 RANGE_MAP = {
     "1h": timedelta(hours=1),
@@ -25,81 +31,21 @@ RANGE_MAP = {
     "1y": timedelta(days=365),
 }
 
-def get_time_window(range_key: str):
-    if range_key not in RANGE_MAP:
-        raise HTTPException(status_code=400, detail="Rango de tiempo no válido")
-    now = datetime.now(timezone.utc)
-    start = now - RANGE_MAP[range_key]
-    return start, now
-
-# ---------- MODELOS ----------
-class BaseTelemetry(BaseModel):
-    id: str = Field(..., description="deviceId")
-    la: Optional[float] = None
-    lo: Optional[float] = None
-    b: Optional[float] = None
-    s: Optional[float] = None
-    intervalSec: Optional[int] = None
-
-class NPKSample(BaseModel):
-    n: float
-    p: float
-    k: float
-
-class SoilMoistSample(BaseModel):
-    v: float
-
-class FertSample(BaseModel):
-    ec: float
-    st: Optional[float] = None
-
-class HygroSample(BaseModel):
-    at: float
-    rh: float
-
-class LeafSample(BaseModel):
-    w: bool
-    wd: Optional[float] = None
-
-class RainSample(BaseModel):
-    r: float
-    ri: Optional[float] = None
-
-class ThermalSample(BaseModel):
-    tt: float
-
-class NPKTelemetry(BaseTelemetry):
-    samples: List[NPKSample]
-
-class SoilMoistureTelemetry(BaseTelemetry):
-    samples: List[SoilMoistSample]
-
-class FertirrigationTelemetry(BaseTelemetry):
-    samples: List[FertSample]
-
-class HygrometerTelemetry(BaseTelemetry):
-    samples: List[HygroSample]
-
-class LeafWetnessTelemetry(BaseTelemetry):
-    samples: List[LeafSample]
-
-class RainGaugeTelemetry(BaseTelemetry):
-    samples: List[RainSample]
-
-class ThermalStressTelemetry(BaseTelemetry):
-    samples: List[ThermalSample]
 
 # ---------- FIREBASE ----------
 cred = credentials.Certificate("firebase-account.json")
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
+
 # ---------- FASTAPI ----------
 app = FastAPI(title="AgroMind Telemetry API")
+
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "AgroMind Telemetry API"}
+
 
 # ---------- AUTH ----------
 def verify_api_key(
@@ -110,109 +56,266 @@ def verify_api_key(
     if key != API_KEY:
         raise HTTPException(status_code=401, detail="API key inválida")
 
+
 # ---------- HELPERS ----------
+def get_time_window(range_key: str):
+    if range_key not in RANGE_MAP:
+        raise HTTPException(status_code=400, detail="Rango de tiempo no válido")
+    now = datetime.now(timezone.utc)
+    start = now - RANGE_MAP[range_key]
+    return start, now
+
+
 def day_id(dt: datetime) -> str:
     return dt.strftime("%Y%m%d")
+
 
 def day_start_utc(dt: datetime) -> datetime:
     return datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
 
-def values_from_sample(measurement_type: str, sample: Any) -> Dict[str, float]:
-    if measurement_type == "npk":
+
+# ---------- MODELOS (CONFIG) ----------
+class ScheduleItem(BaseModel):
+    sensorId: int = Field(..., description="Firmware sensorId (int), usado por el schedule del dispositivo")
+    rail: int = Field(..., description="0..2 (o -1 si no quieres toggle)")
+    warmupMs: int = Field(0, description="Warmup extra por lectura")
+
+
+class TelemetryConfigOut(BaseModel):
+    intervalSec: int = SAMPLE_INTERVAL_SEC_DEFAULT
+    samplesPerBatch: int = SAMPLES_PER_BATCH_DEFAULT
+    schedule: List[ScheduleItem] = Field(default_factory=list)
+
+
+# ---------- MODELOS (INGEST COMPACT) ----------
+class CompactBatchItem(BaseModel):
+    t: int = Field(..., description="typeCode int (1..9)")
+    s: List[Any] = Field(..., description="samples compactos (números o arrays)")
+
+class CompactBatchTelemetry(BaseModel):
+    i: str = Field(..., description="deviceId")
+    b: Optional[int] = Field(None, description="battery*10 (0..1000)")
+    s: Optional[int] = Field(None, description="signal dBm*10 (negativo)")
+    iv: Optional[int] = Field(None, description="intervalSec real del batch")
+    la: Optional[int] = Field(None, description="lat * 1e6 (int)")
+    lo: Optional[int] = Field(None, description="lon * 1e6 (int)")
+    it: List[CompactBatchItem] = Field(..., description="items por sensor (máx 4)")
+
+
+# ---------- TYPE MAP / PARSER ----------
+# IMPORTANTE: estas escalas deben coincidir con lo que envía el firmware:
+# - soil moisture: % entero
+# - hygrometer: at10, rh10 => /10
+# - thermal: tt10 => /10
+# - leaf: [wet(0/1), wd(sec), m10] => m10/10
+# - ORP: mV entero
+# - tension: 0.1kPa => /10
+def values_from_compact(type_code: int, sample: Any) -> Dict[str, float]:
+    # Type 1: NPK => [n,p,k] enteros
+    if type_code == 1:
+        if not (isinstance(sample, list) and len(sample) == 3):
+            raise HTTPException(400, detail="type=1 (npk) espera [n,p,k]")
         return {
-            "nitrogen_mgkg": float(sample.n),
-            "phosphorus_mgkg": float(sample.p),
-            "potassium_mgkg": float(sample.k),
+            "nitrogen_mgkg": float(sample[0]),
+            "phosphorus_mgkg": float(sample[1]),
+            "potassium_mgkg": float(sample[2]),
         }
-    if measurement_type == "soil_moisture":
-        return {"vwc_percent": float(sample.v)}
-    if measurement_type == "fertirrigation":
-        vals = {"ec_mscm": float(sample.ec)}
-        if sample.st is not None:
-            vals["solution_temp_c"] = float(sample.st)
-        return vals
-    if measurement_type == "hygrometer":
-        return {"air_temp_c": float(sample.at), "rh_percent": float(sample.rh)}
-    if measurement_type == "leaf_wetness":
-        vals = {"wet": 1.0 if bool(sample.w) else 0.0}
-        if sample.wd is not None:
-            vals["wet_duration_s"] = float(sample.wd)
-        return vals
-    if measurement_type == "rain_gauge":
-        vals = {"rainfall_mm": float(sample.r)}
-        if sample.ri is not None:
-            vals["intensity_mm_h"] = float(sample.ri)
-        return vals
-    if measurement_type == "thermal_stress":
-        return {"temperature_c": float(sample.tt)}
-    raise HTTPException(status_code=400, detail=f"type no soportado: {measurement_type}")
 
-def resolve_sensor_by_index(device_id: str):
+    # Type 2: soil moisture => v
+    if type_code == 2:
+        if isinstance(sample, list):
+            if len(sample) != 1:
+                raise HTTPException(400, detail="type=2 (soil) espera v o [v]")
+            sample = sample[0]
+        return {"vwc_percent": float(sample)}
+
+    # Type 3: fert => [ecX, stX]
+    if type_code == 3:
+        if not (isinstance(sample, list) and len(sample) == 2):
+            raise HTTPException(400, detail="type=3 (fert) espera [ec,st]")
+        return {
+            "ec_mscm": float(sample[0]) / 100.0,
+            "solution_temp_c": float(sample[1]) / 10.0
+        }
+
+    # Type 4: hygro => [at10, rh10]
+    if type_code == 4:
+        if not (isinstance(sample, list) and len(sample) == 2):
+            raise HTTPException(400, detail="type=4 (hygro) espera [at10,rh10]")
+        return {
+            "air_temp_c": float(sample[0]) / 10.0,
+            "rh_percent": float(sample[1]) / 10.0
+        }
+
+    # Type 5: leaf => [wet(0/1), wd(sec), m10]
+    if type_code == 5:
+        if not (isinstance(sample, list) and len(sample) == 3):
+            raise HTTPException(400, detail="type=5 (leaf) espera [wet,wd,m10]")
+        wet = 1.0 if int(sample[0]) != 0 else 0.0
+        return {
+            "wet": wet,
+            "wet_duration_s": float(sample[1]),
+            "leaf_moist_pct": float(sample[2]) / 10.0
+        }
+
+    # Type 6: rain => [rX, riX]
+    if type_code == 6:
+        if not (isinstance(sample, list) and len(sample) == 2):
+            raise HTTPException(400, detail="type=6 (rain) espera [r,ri]")
+        return {
+            "rainfall_mm": float(sample[0]) / 10.0,
+            "intensity_mm_h": float(sample[1]) / 10.0
+        }
+
+    # Type 7: thermal => tt10
+    if type_code == 7:
+        if isinstance(sample, list):
+            if len(sample) != 1:
+                raise HTTPException(400, detail="type=7 (thermal) espera tt o [tt]")
+            sample = sample[0]
+        return {"temperature_c": float(sample) / 10.0}
+
+    # Type 8: ORP mV entero
+    if type_code == 8:
+        if isinstance(sample, list):
+            if len(sample) != 1:
+                raise HTTPException(400, detail="type=8 (orp) espera mv o [mv]")
+            sample = sample[0]
+        return {"orp_mv": float(sample)}
+
+    # Type 9: Soil tension (0.1kPa) => kPa
+    if type_code == 9:
+        if isinstance(sample, list):
+            if len(sample) != 1:
+                raise HTTPException(400, detail="type=9 (tension) espera x o [x]")
+            sample = sample[0]
+        return {"tension_kpa": float(sample) / 10.0}
+
+    raise HTTPException(status_code=400, detail=f"type no soportado: {type_code}")
+
+
+# ---------- DEVICE RESOLUTION / SENSOR MAP ----------
+def resolve_tenant(device_id: str) -> str:
     idx_ref = db.document(f"deviceIndex/{device_id}")
-    snap = idx_ref.get()
-    if snap.exists:
-        d = snap.to_dict() or {}
-        if d.get("tenantId") and d.get("sensorId"):
-            return d["tenantId"], d["sensorId"]
-    return None
-
-def write_index(device_id: str, tenant_id: str, sensor_id: str):
-    db.document(f"deviceIndex/{device_id}").set(
-        {"tenantId": tenant_id, "sensorId": sensor_id, "updatedAt": firestore.SERVER_TIMESTAMP},
-        merge=True
-    )
-
-def resolve_sensor(device_id: str):
-    idx_ref = db.document(f"deviceIndex/{device_id}")
-    snap = idx_ref.get()
-    if snap.exists:
-        d = snap.to_dict() or {}
-        if d.get("tenantId") and d.get("sensorId"):
-            return d["tenantId"], d["sensorId"]
+    idx_snap = idx_ref.get()
+    if idx_snap.exists:
+        d = idx_snap.to_dict() or {}
+        tid = d.get("tenantId")
+        if tid:
+            return tid
 
     docs = list(
         db.collection_group("sensors")
           .where("hardwareId", "==", device_id)
-          .limit(2)
+          .limit(20)
           .stream()
     )
-
     if not docs:
         docs = list(
             db.collection_group("sensors")
               .where("deviceId", "==", device_id)
-              .limit(2)
+              .limit(20)
+              .stream()
+        )
+    if not docs:
+        raise HTTPException(status_code=404, detail=f"Dispositivo no registrado: {device_id}")
+
+    parts = docs[0].reference.path.split("/")
+    tenant_id = parts[1]
+
+    idx_ref.set({"tenantId": tenant_id, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    return tenant_id
+
+
+def get_device_ref(tenant_id: str, device_id: str):
+    return db.document(f"tenants/{tenant_id}/devices/{device_id}")
+
+
+def get_or_build_sensor_map(tenant_id: str, device_id: str) -> Dict[int, str]:
+    device_ref = get_device_ref(tenant_id, device_id)
+    device_snap = device_ref.get()
+    if device_snap.exists:
+        d = device_snap.to_dict() or {}
+        sm = d.get("sensorMap")
+        if isinstance(sm, dict) and sm:
+            out = {}
+            for k, v in sm.items():
+                try:
+                    out[int(k)] = str(v)
+                except Exception:
+                    continue
+            if out:
+                return out
+
+    idx_ref = db.document(f"deviceIndex/{device_id}")
+    idx_snap = idx_ref.get()
+    if idx_snap.exists:
+        d = idx_snap.to_dict() or {}
+        sm = d.get("sensorMap")
+        if isinstance(sm, dict) and sm:
+            out = {}
+            for k, v in sm.items():
+                try:
+                    out[int(k)] = str(v)
+                except Exception:
+                    continue
+            if out:
+                return out
+
+    sensors = list(
+        db.collection(f"tenants/{tenant_id}/sensors")
+          .where("hardwareId", "==", device_id)
+          .stream()
+    )
+    if not sensors:
+        sensors = list(
+            db.collection(f"tenants/{tenant_id}/sensors")
+              .where("deviceId", "==", device_id)
               .stream()
         )
 
-    if not docs:
-        raise HTTPException(status_code=404, detail=f"Sensor no registrado para id={device_id}")
-    if len(docs) > 1:
-        raise HTTPException(status_code=409, detail=f"id duplicado en múltiples sensores: {device_id}")
+    if not sensors:
+        raise HTTPException(status_code=404, detail=f"No hay sensores asociados a deviceId={device_id} en tenant={tenant_id}")
 
-    snap = docs[0]
-    parts = snap.reference.path.split("/")
-    tenant_id = parts[1]
-    sensor_id = parts[3]
+    sensor_map: Dict[int, str] = {}
+    for s in sensors:
+        sd = s.to_dict() or {}
+        tc = None
+        tel = sd.get("telemetry") or {}
+        if isinstance(tel, dict):
+            tc = tel.get("typeCode")
 
-    db.document(f"deviceIndex/{device_id}").set(
-        {"tenantId": tenant_id, "sensorId": sensor_id, "updatedAt": firestore.SERVER_TIMESTAMP},
-        merge=True
-    )
+        if tc is None:
+            tc = sd.get("typeCode")
 
-    return tenant_id, sensor_id
+        if tc is None:
+            continue
+
+        try:
+            tc_int = int(tc)
+        except Exception:
+            continue
+
+        if tc_int in sensor_map:
+            raise HTTPException(
+                status_code=409,
+                detail=f"typeCode duplicado {tc_int} en múltiples sensores para deviceId={device_id}"
+            )
+
+        sensor_map[tc_int] = s.id
+
+    if not sensor_map:
+        raise HTTPException(status_code=400, detail=f"No se pudo construir sensorMap para deviceId={device_id}. Falta telemetry.typeCode en sensores.")
+
+    device_ref.set({"sensorMap": {str(k): v for k, v in sensor_map.items()}, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    idx_ref.set({"tenantId": tenant_id, "sensorMap": {str(k): v for k, v in sensor_map.items()}, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+
+    return sensor_map
+
 
 # ---------- DAILY AGG ----------
 @firestore.transactional
 def tx_apply_daily_agg(transaction: firestore.Transaction, agg_ref, day_ts: datetime, updates: Dict[str, Any]):
-    """
-    updates:
-      {
-        "seenIds": { "YYYYMMDDHHMM": True, ... },
-        "metrics": { "temp": {"min":..,"max":..,"sum":..,"count":..}, ... }  (incremental)
-      }
-    Evita doble conteo si el device reintenta el mismo lote.
-    """
     snap = transaction.get(agg_ref)
     doc = snap.to_dict() if snap.exists else {"day": day_ts, "metrics": {}, "seen": {}}
     doc.setdefault("day", day_ts)
@@ -221,10 +324,6 @@ def tx_apply_daily_agg(transaction: firestore.Transaction, agg_ref, day_ts: date
 
     seen: Dict[str, bool] = doc["seen"]
     metrics: Dict[str, Dict[str, Any]] = doc["metrics"]
-
-    for rid, payload in updates.items():
-        if rid == "_metricsByReading":
-            continue
 
     metrics_by_reading: Dict[str, Dict[str, float]] = updates["_metricsByReading"]
 
@@ -238,7 +337,7 @@ def tx_apply_daily_agg(transaction: firestore.Transaction, agg_ref, day_ts: date
             cur = metrics.get(k) or {"min": v, "max": v, "sum": 0.0, "count": 0}
             cur["min"] = min(float(cur.get("min", v)), v)
             cur["max"] = max(float(cur.get("max", v)), v)
-            cur["sum"] = float(cur.get("sum", 0.0)) + v
+            cur["sum"] = float(cur.get("sum", 0.0)) + float(v)
             cur["count"] = int(cur.get("count", 0)) + 1
             metrics[k] = cur
 
@@ -247,165 +346,215 @@ def tx_apply_daily_agg(transaction: firestore.Transaction, agg_ref, day_ts: date
     doc["updatedAt"] = firestore.SERVER_TIMESTAMP
     transaction.set(agg_ref, doc, merge=True)
 
-# ---------- INGEST BATCH ----------
-def ingest_batch(measurement_type: str, payload: BaseTelemetry, samples: list):
-    if not samples:
-        raise HTTPException(status_code=400, detail="samples vacío")
 
-    tenant_id, sensor_id = resolve_sensor(payload.id)
+# ---------- INGEST (COMPACT BATCH) ----------
+def ingest_compact_batch(payload: CompactBatchTelemetry):
+    if not payload.it:
+        raise HTTPException(status_code=400, detail="it vacío")
+
+    if len(payload.it) > MAX_ITEMS_PER_BATCH:
+        raise HTTPException(status_code=400, detail=f"Máximo {MAX_ITEMS_PER_BATCH} items por batch")
+
+    device_id = payload.i
+    tenant_id = resolve_tenant(device_id)
+    sensor_map = get_or_build_sensor_map(tenant_id, device_id)
 
     now = datetime.now(timezone.utc)
-    interval = int(payload.intervalSec or SAMPLE_INTERVAL_SEC_DEFAULT)
-    n = len(samples)
 
-    sensor_ref = db.document(f"tenants/{tenant_id}/sensors/{sensor_id}")
+    interval = int(payload.iv or SAMPLE_INTERVAL_SEC_DEFAULT)
+    if interval < 60:
+        interval = 60
 
-    meta = {
-        "deviceId": payload.id,
-        "lat": payload.la,
-        "lon": payload.lo,
-        "batteryPct": payload.b,
-        "rssi": payload.s,
+    battery_pct = (float(payload.b) / 10.0) if payload.b is not None else None
+    rssi_dbm = (float(payload.s) / 10.0) if payload.s is not None else None
+    lat = (float(payload.la) / 1e6) if payload.la is not None else None
+    lon = (float(payload.lo) / 1e6) if payload.lo is not None else None
+
+    meta_base = {
+        "deviceId": device_id,
         "intervalSec": interval,
+        "batteryPct": battery_pct,
+        "rssi": rssi_dbm,
+        "lat": lat,
+        "lon": lon,
     }
 
-    batch = db.batch()
+    b = db.batch()
 
-    daily_payloads: Dict[str, Dict[str, Dict[str, float]]] = {}
+    dev_ref = get_device_ref(tenant_id, device_id)
+    dev_status_update = {
+        "status.lastSeenAt": now,
+        "status.batteryPct": battery_pct,
+        "status.rssi": rssi_dbm,
+    }
+    if lat is not None and lon is not None:
+        dev_status_update["status.lastLat"] = lat
+        dev_status_update["status.lastLon"] = lon
 
-    last_ts = None
-    last_values = None
+    b.set(dev_ref, dev_status_update, merge=True)
 
-    for i, smp in enumerate(samples):
-        ts = now - timedelta(seconds=(n - 1 - i) * interval)
-        values = values_from_sample(measurement_type, smp)
+    daily_by_sensor: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
 
-        last_ts = ts
-        last_values = values
+    ingested_total = 0
+    sensors_touched: List[str] = []
 
-        reading_id = ts.strftime("%Y%m%d%H%M")
-        reading_ref = db.document(f"tenants/{tenant_id}/sensors/{sensor_id}/readings/{reading_id}")
+    for item in payload.it:
+        type_code = int(item.t)
+        samples = item.s
+        if not samples:
+            continue
 
-        expires_at = ts + timedelta(days=RAW_RETENTION_DAYS)
+        if len(samples) > MAX_SAMPLES_PER_ITEM:
+            raise HTTPException(status_code=400, detail=f"Demasiadas muestras en item type={type_code}")
 
-        data = {
-        "ts": ts,
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-        "meta": meta,
-        "meta.lastType": measurement_type,
-        "expiresAt": expires_at,
+        sensor_doc_id = sensor_map.get(type_code)
+        if not sensor_doc_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No hay sensor asignado para typeCode={type_code} en deviceId={device_id}. Revisa telemetry.typeCode en Firestore."
+            )
+
+        sensor_ref = db.document(f"tenants/{tenant_id}/sensors/{sensor_doc_id}")
+        sensors_touched.append(sensor_doc_id)
+
+        n = len(samples)
+        last_ts = None
+        last_values = None
+
+        for i, smp in enumerate(samples):
+            ts = now - timedelta(seconds=(n - 1 - i) * interval)
+            values = values_from_compact(type_code, smp)
+
+            last_ts = ts
+            last_values = values
+
+            reading_id = ts.strftime("%Y%m%d%H%M")
+            reading_ref = db.document(f"tenants/{tenant_id}/sensors/{sensor_doc_id}/readings/{reading_id}")
+
+            expires_at = ts + timedelta(days=RAW_RETENTION_DAYS)
+
+            data: Dict[str, Any] = {
+                "ts": ts,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+                "meta": meta_base,
+                "expiresAt": expires_at,
+                "meta.typeCode": type_code,
+            }
+            for k, v in values.items():
+                data[f"values.{k}"] = float(v)
+
+            b.set(reading_ref, data, merge=True)
+
+            did = day_id(ts)
+            daily_by_sensor.setdefault(sensor_doc_id, {})
+            daily_by_sensor[sensor_doc_id].setdefault(did, {})
+            daily_by_sensor[sensor_doc_id][did][reading_id] = values
+
+            ingested_total += 1
+
+        sensor_update: Dict[str, Any] = {
+            "status.batteryPct": battery_pct,
+            "status.rssi": rssi_dbm,
+            "status.lastSeenAt": now,
+            "lastReading.ts": last_ts,
+            "lastReading.values": last_values,
+            "lastReading.typeCode": type_code,
         }
-        for k, v in values.items():
-            data[f"values.{k}"] = v
+        if lat is not None and lon is not None:
+            sensor_update["status.lastLat"] = lat
+            sensor_update["status.lastLon"] = lon
 
-        batch.set(reading_ref, data, merge=True)
+        b.set(sensor_ref, sensor_update, merge=True)
 
-        did = day_id(ts)
-        daily_payloads.setdefault(did, {})
-
-        merged = daily_payloads[did].get(reading_id, {})
-        merged.update(values)
-        daily_payloads[did][reading_id] = merged
-
-    batch.set(sensor_ref, {
-        "status": {
-            "batteryPct": payload.b,
-            "rssi": payload.s,
-            "lastSeenAt": now,
-            "lastLat": payload.la,
-            "lastLon": payload.lo,
-        },
-        "lastReading": {
-            "ts": last_ts,
-            "values": last_values,
-            "type": measurement_type,
-        }
-    }, merge=True)
-
-    batch.commit()
+    b.commit()
 
     updated_days = []
-    for did, readings_map in daily_payloads.items():
-        day_ts = day_start_utc(datetime.strptime(did, "%Y%m%d").replace(tzinfo=timezone.utc))
-        agg_ref = db.document(f"tenants/{tenant_id}/sensors/{sensor_id}/dailyAgg/{did}")
-        tx = db.transaction()
-        tx_apply_daily_agg(tx, agg_ref, day_ts, {"_metricsByReading": readings_map})
-        updated_days.append(did)
+    for sensor_doc_id, days_map in daily_by_sensor.items():
+        for did, readings_map in days_map.items():
+            day_ts = day_start_utc(datetime.strptime(did, "%Y%m%d").replace(tzinfo=timezone.utc))
+            agg_ref = db.document(f"tenants/{tenant_id}/sensors/{sensor_doc_id}/dailyAgg/{did}")
+            tx = db.transaction()
+            tx_apply_daily_agg(tx, agg_ref, day_ts, {"_metricsByReading": readings_map})
+            updated_days.append({"sensorDocId": sensor_doc_id, "day": did})
 
     return {
         "status": "success",
         "tenantId": tenant_id,
-        "sensorId": sensor_id,
-        "type": measurement_type,
-        "ingested": n,
-        "updatedDailyAggDays": updated_days,
+        "deviceId": device_id,
+        "ingestedReadings": ingested_total,
+        "sensorsTouched": list(sorted(set(sensors_touched))),
+        "updatedDailyAgg": updated_days[:50],
     }
 
-# ---------- POST endpoints ----------
-@app.post("/sensors/npk")
-def post_npk(data: NPKTelemetry, _: None = Depends(verify_api_key)):
-    return ingest_batch("npk", data, data.samples)
 
-@app.post("/sensors/soil-moisture")
-def post_soil_moisture(data: SoilMoistureTelemetry, _: None = Depends(verify_api_key)):
-    return ingest_batch("soil_moisture", data, data.samples)
+# ---------- POST: single endpoint ----------
+@app.post("/telemetry/batch")
+def post_telemetry_batch(data: CompactBatchTelemetry, _: None = Depends(verify_api_key)):
+    return ingest_compact_batch(data)
 
-@app.post("/sensors/fertirrigation")
-def post_fertirrigation(data: FertirrigationTelemetry, _: None = Depends(verify_api_key)):
-    return ingest_batch("fertirrigation", data, data.samples)
 
-@app.post("/sensors/hygrometer")
-def post_hygrometer(data: HygrometerTelemetry, _: None = Depends(verify_api_key)):
-    return ingest_batch("hygrometer", data, data.samples)
-
-@app.post("/sensors/leaf-wetness")
-def post_leaf_wetness(data: LeafWetnessTelemetry, _: None = Depends(verify_api_key)):
-    return ingest_batch("leaf_wetness", data, data.samples)
-
-@app.post("/sensors/rain-gauge")
-def post_rain_gauge(data: RainGaugeTelemetry, _: None = Depends(verify_api_key)):
-    return ingest_batch("rain_gauge", data, data.samples)
-
-@app.post("/sensors/thermal-stress")
-def post_thermal_stress(data: ThermalStressTelemetry, _: None = Depends(verify_api_key)):
-    return ingest_batch("thermal_stress", data, data.samples)
-
-# ---------- GET endpoints ----------
+# ---------- GET: resolve ----------
 @app.get("/devices/{device_id}/resolve")
 def get_device_resolve(device_id: str, _: None = Depends(verify_api_key)):
-    tenant_id, sensor_id = resolve_sensor(device_id)
-    sensor_ref = db.document(f"tenants/{tenant_id}/sensors/{sensor_id}")
-    snap = sensor_ref.get()
+    tenant_id = resolve_tenant(device_id)
+    dev_ref = get_device_ref(tenant_id, device_id)
+    dev_snap = dev_ref.get()
+    sensor_map = get_or_build_sensor_map(tenant_id, device_id)
+
     return {
         "deviceId": device_id,
         "tenantId": tenant_id,
-        "sensorId": sensor_id,
-        "sensor": snap.to_dict() if snap.exists else None
+        "device": dev_snap.to_dict() if dev_snap.exists else None,
+        "sensorMap": sensor_map,
     }
 
+
+# ---------- GET: config ----------
 @app.get("/devices/{device_id}/config")
 def get_device_config(device_id: str, _: None = Depends(verify_api_key)):
-    tenant_id, sensor_id = resolve_sensor(device_id)
-    ref = db.document(f"tenants/{tenant_id}/sensors/{sensor_id}")
-    snap = ref.get()
-    if not snap.exists:
-        raise HTTPException(status_code=404, detail="sensor no encontrado")
+    tenant_id = resolve_tenant(device_id)
+    dev_ref = get_device_ref(tenant_id, device_id)
+    snap = dev_ref.get()
 
-    s = snap.to_dict() or {}
-    cfg = (s.get("telemetryConfig") or {})
+    out_cfg = {
+        "intervalSec": SAMPLE_INTERVAL_SEC_DEFAULT,
+        "samplesPerBatch": SAMPLES_PER_BATCH_DEFAULT,
+        "schedule": []
+    }
 
-    out = {
+    if snap.exists:
+        d = snap.to_dict() or {}
+        tc = (d.get("telemetryConfig") or {})
+        if isinstance(tc, dict):
+            out_cfg["intervalSec"] = int(tc.get("intervalSec", out_cfg["intervalSec"]))
+            out_cfg["samplesPerBatch"] = int(tc.get("samplesPerBatch", out_cfg["samplesPerBatch"]))
+            sch = tc.get("schedule", [])
+            if isinstance(sch, list):
+                norm = []
+                for x in sch[:MAX_SCHEDULE]:
+                    if not isinstance(x, dict):
+                        continue
+                    sid = int(x.get("sensorId", 0) or 0)
+                    rail = int(x.get("rail", 0) or 0)
+                    warm = int(x.get("warmupMs", 0) or 0)
+                    if sid <= 0:
+                        continue
+                    if rail < -1 or rail > 2:
+                        rail = 0
+                    if warm < 0:
+                        warm = 0
+                    if warm > 60000:
+                        warm = 60000
+                    norm.append({"sensorId": sid, "rail": rail, "warmupMs": warm})
+                out_cfg["schedule"] = norm
+
+    return {
         "deviceId": device_id,
         "tenantId": tenant_id,
-        "sensorId": sensor_id,
-        "telemetryConfig": {
-            "intervalSec": cfg.get("intervalSec", 300),
-            "samplesPerBatch": cfg.get("samplesPerBatch", 12),
-            "enabled": cfg.get("enabled", {}),
-        }
+        "telemetryConfig": out_cfg
     }
-    return out
 
+# ---------- GET: readings / dailyAgg ----------
 @app.get("/tenants/{tenant_id}/sensors/{sensor_id}/readings")
 def get_sensor_readings(
     tenant_id: str,
@@ -445,7 +594,7 @@ def get_sensor_daily_agg(
         rows.append({"id": s.id, **d})
     return {"tenantId": tenant_id, "sensorId": sensor_id, "days": days, "items": rows}
 
-# ---------- MAINTENANCE endpoints ----------
+# ---------- MAINTENANCE ----------
 @app.post("/maintenance/purge-readings")
 def purge_readings(
     older_than_days: int = Query(30, ge=1, le=3650),
@@ -487,140 +636,3 @@ def purge_readings(
         "first": snaps[0].reference.path,
         "last": snaps[-1].reference.path,
     }
-
-@app.post("/maintenance/recompute-tenant-stats")
-def recompute_tenant_stats(
-    tenant_id: str = Query(...),
-    stale_hours: int = Query(2, ge=1, le=168),
-    low_batt: int = Query(20, ge=1, le=100),
-    _: None = Depends(verify_api_key),
-):
-    now = datetime.now(timezone.utc)
-    stale_cutoff = now - timedelta(hours=stale_hours)
-
-    sensors_ref = db.collection(f"tenants/{tenant_id}/sensors")
-    sensors_total = 0
-    sensors_active = 0
-    battery_low = 0
-
-    for s in sensors_ref.stream():
-      sensors_total += 1
-      d = s.to_dict() or {}
-      st = (d.get("status") or {})
-      last_seen = st.get("lastSeenAt")
-      batt = st.get("batteryPct")
-
-      if isinstance(last_seen, datetime) and last_seen >= stale_cutoff:
-        sensors_active += 1
-
-      if isinstance(batt, (int, float)) and batt < low_batt:
-        battery_low += 1
-
-    sensors_stale = max(0, sensors_total - sensors_active)
-
-    alerts_open = 0
-    alerts_critical_open = 0
-    alerts_ref = db.collection(f"tenants/{tenant_id}/alerts")
-    for a in alerts_ref.where("status", "==", "open").stream():
-      alerts_open += 1
-      d = a.to_dict() or {}
-      if d.get("severity") == "critical":
-        alerts_critical_open += 1
-
-    recs_open = 0
-    recs_last24h = 0
-    recs_ref = db.collection(f"tenants/{tenant_id}/aiRecommendations")
-
-    last24h_cutoff = now - timedelta(hours=24)
-    for r in recs_ref.stream():
-      d = r.to_dict() or {}
-      status = d.get("status", "open")
-      if status != "done":
-        recs_open += 1
-
-      created = d.get("createdAt")
-      if isinstance(created, datetime) and created >= last24h_cutoff:
-        recs_last24h += 1
-
-    stats_ref = db.document(f"tenants/{tenant_id}/stats/current")
-    stats_ref.set({
-      "updatedAt": firestore.SERVER_TIMESTAMP,
-      "staleMs": stale_hours * 60 * 60 * 1000,
-      "sensors": {
-        "total": sensors_total,
-        "active": sensors_active,
-        "stale": sensors_stale,
-        "batteryLow": battery_low,
-      },
-      "alerts": {
-        "open": alerts_open,
-        "criticalOpen": alerts_critical_open,
-      },
-      "recs": {
-        "open": recs_open,
-        "last24h": recs_last24h,
-      }
-    }, merge=True)
-
-    return {"status": "ok", "tenantId": tenant_id}
-
-@app.post("/maintenance/recompute-all-tenant-stats")
-def recompute_all_tenant_stats(
-    stale_hours: int = Query(2, ge=1, le=168),
-    low_batt: int = Query(20, ge=1, le=100),
-    _: None = Depends(verify_api_key),
-):
-    tenants = [t.id for t in db.collection("tenants").stream()]
-    done = []
-    for tid in tenants:
-      now = datetime.now(timezone.utc)
-      stale_cutoff = now - timedelta(hours=stale_hours)
-
-      sensors_total = 0
-      sensors_active = 0
-      battery_low = 0
-      for s in db.collection(f"tenants/{tid}/sensors").stream():
-        sensors_total += 1
-        d = s.to_dict() or {}
-        st = (d.get("status") or {})
-        last_seen = st.get("lastSeenAt")
-        batt = st.get("batteryPct")
-        if isinstance(last_seen, datetime) and last_seen >= stale_cutoff:
-          sensors_active += 1
-        if isinstance(batt, (int, float)) and batt < low_batt:
-          battery_low += 1
-
-      alerts_open = 0
-      alerts_critical_open = 0
-      for a in db.collection(f"tenants/{tid}/alerts").where("status", "==", "open").stream():
-        alerts_open += 1
-        if (a.to_dict() or {}).get("severity") == "critical":
-          alerts_critical_open += 1
-
-      recs_open = 0
-      recs_last24h = 0
-      last24h_cutoff = now - timedelta(hours=24)
-      for r in db.collection(f"tenants/{tid}/aiRecommendations").stream():
-        d = r.to_dict() or {}
-        if d.get("status", "open") != "done":
-          recs_open += 1
-        created = d.get("createdAt")
-        if isinstance(created, datetime) and created >= last24h_cutoff:
-          recs_last24h += 1
-
-      db.document(f"tenants/{tid}/stats/current").set({
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-        "staleMs": stale_hours * 60 * 60 * 1000,
-        "sensors": {
-          "total": sensors_total,
-          "active": sensors_active,
-          "stale": max(0, sensors_total - sensors_active),
-          "batteryLow": battery_low,
-        },
-        "alerts": {"open": alerts_open, "criticalOpen": alerts_critical_open},
-        "recs": {"open": recs_open, "last24h": recs_last24h},
-      }, merge=True)
-
-      done.append(tid)
-
-    return {"status": "ok", "tenants": done}

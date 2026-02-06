@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.30.6
+firebase-admin==6.5.0
+google-cloud-firestore==2.16.1
+paho-mqtt==1.6.1
+orjson==3.10.7
+pydantic==2.9.2
+python-dotenv==1.0.1

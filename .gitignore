@@ -54,8 +54,6 @@ instance/
 # ------------------------------
 firebase-account.json
 **/firebase-account.json
-
-# (opcional) otras credenciales comunes
 *.pem
 *.key
 *.p12
